@@ -1,39 +1,26 @@
-import asyncio, json, os, time, random, re
-from datetime import datetime
+from temporalio import activity
+import aiohttp, os, json, asyncio, re, time, random
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
-import aiohttp
-from bs4 import BeautifulSoup
-from tqdm import tqdm
 from playwright.async_api import async_playwright
 from playwright._impl._errors import TargetClosedError
-from temporalio import activity
+from bs4 import BeautifulSoup
 
 BASE_URL = "http://www.law.go.kr"
-
-# ───────────── 공통 상수 (네 코드 유지) ─────────────
-START_PAGE = 50
-END_PAGE = 66
-WORKERS = 14
-BROWSER_COUNT = 2
-WORKERS_PER_BROWSER = WORKERS // BROWSER_COUNT
+DISPLAY = 100
+TARGET_DAYS = 1
 
 HEADERS = {
     "User-Agent": random.choice([
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         "Mozilla/5.0 (X11; Linux x86_64; rv:120.0)"
-    ]),
-    "Accept": "text/html,application/json,*/*",
-    "Referer": "https://www.law.go.kr/",
-    "Connection": "keep-alive",
-    "Accept-Language": "ko-KR,ko;q=0.9"
+    ])
 }
 
 link_cache = {}
 
-# ───────────── 유틸 (네 코드 거의 그대로) ─────────────
-
+# ---------- (A) 기존 상세 크롤링 유틸 거의 그대로 유지 ----------
 def clean_html(text: str):
     comments = re.findall(r"<!--.*?-->", text, flags=re.DOTALL)
     placeholders = {}
@@ -54,52 +41,21 @@ def clean_html(text: str):
 
     return r
 
-
 def build_detail_url(onclick, params):
     if "fncLsPttnLinkPop" in onclick:
         return f"https://www.law.go.kr/LSW/lsLinkCommonInfo.do?lspttninfSeq={params[0]}"
     if "fncLsLawPop" in onclick and not any(x in onclick for x in ["XX","BG","BF","BE"]):
         return f"https://www.law.go.kr/LSW/lsLinkCommonInfo.do?lsJoLnkSeq={params[0]}"
     if "fncArLawPop" in onclick:
-        return (
-            "https://www.law.go.kr/LSW/lsSideInfoP.do"
-            f"?lsNm={params[0]}&ancYd={params[1]}"
-            f"&urlMode=lsRvsDocInfoR&ancNo={params[2]}"
-        )
+        return f"https://www.law.go.kr/LSW/lsSideInfoP.do?lsNm={params[0]}&ancYd={params[1]}&urlMode=lsRvsDocInfoR&ancNo={params[2]}"
     return None
-
 
 async def safe_goto(page, url):
     for _ in range(3):
         try:
             return await page.goto(url, timeout=90000, wait_until="networkidle")
-        except Exception:
+        except:
             await asyncio.sleep(2)
-
-
-async def fetch_list(session, page_no):
-    params = {
-        "OC": "admin",
-        "target": "eflaw",
-        "type": "JSON",
-        "sort": "ddsc",
-        "nw": "2,3",
-        "display": 100,
-        "page": page_no
-    }
-    url = f"{BASE_URL}/DRF/lawSearch.do"
-
-    for retry in range(5):
-        try:
-            async with session.get(url, params=params, headers=HEADERS, timeout=30) as r:
-                data = await r.json()
-                return data["LawSearch"].get("law", [])
-        except Exception as e:
-            tqdm.write(f"[fetch_list] page {page_no} retry {retry+1}/5 | {e}")
-            await asyncio.sleep(2)
-
-    return []
-
 
 async def fetch_detail(page, url):
     if url in link_cache:
@@ -116,9 +72,7 @@ async def fetch_detail(page, url):
         pass
 
     try:
-        subs = await page.locator(
-            "div#viewwrapCenter, div.lawcon"
-        ).all_text_contents()
+        subs = await page.locator("div#viewwrapCenter, div.lawcon").all_text_contents()
         txt += "".join(subs)
     except:
         pass
@@ -126,42 +80,59 @@ async def fetch_detail(page, url):
     link_cache[url] = txt
     return txt
 
+# ---------- (B) 목록 API ----------
+async def fetch_list(session, page_no):
+    url = f"{BASE_URL}/DRF/lawSearch.do"
+    params = {
+        "OC": "admin",
+        "target": "eflaw",
+        "type": "JSON",
+        "sort": "ddes",
+        "display": DISPLAY,
+        "page": page_no
+    }
 
-# ───────────── 핵심: ACTIVITY ─────────────
+    async with session.get(url, params=params, headers=HEADERS) as r:
+        data = await r.json()
+        return data["LawSearch"].get("law", [])
 
+# ---------- (C) 핵심 Activity ----------
 @activity.defn
-async def crawl_law_page(page_no: int) -> str:
-    """
-    한 페이지 크롤링 전담 Activity
-    → 결과 JSON 파일 경로 반환
-    """
+async def law_activity():
+    now = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    yesterday = now - timedelta(days=TARGET_DAYS)
+    fmt = "%Y%m%d"
 
-    start = time.time()
+    collected = []
+    page_no = 1
 
     async with aiohttp.ClientSession() as session:
-        laws = await fetch_list(session, page_no)
 
-    async with async_playwright() as p:
-        browser_a = await p.chromium.launch(headless=True)
-        browser_b = await p.chromium.launch(headless=True)
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
 
-        async def process_with_browser(browser, items):
-            contexts = [await browser.new_context() for _ in range(WORKERS_PER_BROWSER)]
-            queue = asyncio.Queue()
-            results = []
-            lock = asyncio.Lock()
+            while True:
+                items = await fetch_list(session, page_no)
 
-            for i, item in enumerate(items, start=1):
-                await queue.put((i, item))
+                # 종료조건 ①: display 미만
+                if len(items) < DISPLAY:
+                    print(f"[STOP] page={page_no} : {len(items)} < {DISPLAY}")
+                    break
 
-            async def worker(context):
-                while True:
-                    try:
-                        idx, item = await queue.get()
-                    except asyncio.CancelledError:
+                # 종료조건 ②: 첫 아이템이 기준일 이전
+                first_day = datetime.strptime(items[0]["공포일자"], fmt).date()
+                if yesterday > first_day:
+                    print(f"[STOP] 신규 법령 없음 (page={page_no})")
+                    break
+
+                for item in items:
+                    cont_day = datetime.strptime(item["공포일자"], fmt).date()
+                    if yesterday > cont_day:
+                        print(f"[STOP] {item['공포일자']} 이전 → 이후 중단")
                         break
 
-                    page = await context.new_page()
+                    # ====== (중요) Playwright 상세 크롤링 시작 ======
+                    page = await browser.new_page()
                     try:
                         url = BASE_URL + item["법령상세링크"]
                         await safe_goto(page, url)
@@ -188,17 +159,6 @@ async def crawl_law_page(page_no: int) -> str:
                             if "ALLJO" in onclick:
                                 continue
 
-                            if any(cls in outer for cls in ["sfon3","sfon4","sfon5"]):
-                                txt = await a.text_content()
-                                if last_key in parsed:
-                                    prev_outer, prev_txt = last_key.split("_",1)
-                                    url_val = parsed[last_key]
-                                    parsed.pop(last_key)
-                                    m = f"{prev_outer}{outer}_{prev_txt}{txt}"
-                                    parsed[m] = url_val
-                                    last_key = m
-                                continue
-
                             durl = build_detail_url(onclick, params)
                             if durl:
                                 txt = await a.text_content()
@@ -215,51 +175,31 @@ async def crawl_law_page(page_no: int) -> str:
                             )
 
                         item["법령"] = clean_html(raw_html)
-
-                        async with lock:
-                            results.append(item)
+                        collected.append(item)
 
                     except TargetClosedError:
-                        await context.close()
-                        context = await browser.new_context()
+                        pass
                     finally:
                         await page.close()
-                        queue.task_done()
 
-            tasks = [asyncio.create_task(worker(ctx)) for ctx in contexts]
-            await queue.join()
+                page_no += 1
 
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await browser.close()
 
-            for ctx in contexts:
-                await ctx.close()
+    # ====== 저장 ======
+    save_time = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d_%H%M%S")
+    out_dir = "/mnt/e/workspace/pytem/datacollection/crawl_results"
+    os.makedirs(out_dir, exist_ok=True)
 
-            return results
+    file_path = f"{out_dir}/law_{save_time}.json"
 
-        mid = len(laws) // 2
-        r1 = asyncio.create_task(process_with_browser(browser_a, laws[:mid]))
-        r2 = asyncio.create_task(process_with_browser(browser_b, laws[mid:]))
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(collected, f, ensure_ascii=False, indent=2)
 
-        out1, out2 = await asyncio.gather(r1, r2)
-        results = out1 + out2
+    print(f"[ACTIVITY] 저장 완료 → {file_path}")
 
-        await browser_a.close()
-        await browser_b.close()
-
-    today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
-    path = (
-        "/mnt/e/workspace/pytem/datacollection/downloads/law/"
-        f"law_{page_no}_{today}.json"
-    )
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(results, ensure_ascii=False, indent=2)
-                .replace("\\n", "\n"))
-
-    elapsed = time.time() - start
-    tqdm.write(f"[Activity] page {page_no} 완료 | {elapsed:.1f}초")
-
-    return path
+    return {
+        "file_path": file_path,
+        "total_items": len(collected),
+        "last_page": page_no
+    }
