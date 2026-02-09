@@ -1,12 +1,12 @@
 import asyncio, json, os, time, random, re
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+import aiohttp
 from temporalio import activity
 from playwright.async_api import async_playwright
 from playwright._impl._errors import TargetClosedError
 from bs4 import BeautifulSoup
-from tqdm import tqdm
-import aiohttp
 
 BASE_URL = "http://www.law.go.kr"
 
@@ -50,7 +50,11 @@ def build_detail_url(onclick, params):
     if "fncLsLawPop" in onclick and not any(x in onclick for x in ["XX","BG","BF","BE"]):
         return f"https://www.law.go.kr/LSW/lsLinkCommonInfo.do?lsJoLnkSeq={params[0]}"
     if "fncArLawPop" in onclick:
-        return f"https://www.law.go.kr/LSW/lsSideInfoP.do?lsNm={params[0]}&ancYd={params[1]}&urlMode=lsRvsDocInfoR&ancNo={params[2]}"
+        return (
+            "https://www.law.go.kr/LSW/lsSideInfoP.do?"
+            f"lsNm={params[0]}&ancYd={params[1]}"
+            f"&urlMode=lsRvsDocInfoR&ancNo={params[2]}"
+        )
     return None
 
 async def safe_goto(page, url):
@@ -72,15 +76,13 @@ async def fetch_list(session, page_no):
     }
     url = f"{BASE_URL}/DRF/lawSearch.do"
 
-    for retry in range(5):
+    for _ in range(5):
         try:
             async with session.get(url, params=params, headers=HEADERS, timeout=30) as r:
                 data = await r.json()
                 return data["LawSearch"].get("law", [])
-        except Exception as e:
-            tqdm.write(f"[fetch_list] 페이지 {page_no} 재시도 {retry+1}/5 | {e}")
+        except:
             await asyncio.sleep(2)
-
     return []
 
 async def fetch_detail(page, url):
@@ -109,13 +111,6 @@ async def fetch_detail(page, url):
 
 @activity.defn
 async def crawl_law_page(page_no: int, workers: int, browser_count: int) -> str:
-    """
-    👉 Temporal Activity:
-      - 한 페이지 크롤링 전담
-      - Playwright 포함
-      - 결과 JSON 파일 경로 반환
-    """
-
     start = time.time()
 
     async with aiohttp.ClientSession() as session:
@@ -139,7 +134,7 @@ async def crawl_law_page(page_no: int, workers: int, browser_count: int) -> str:
             async def worker(context):
                 while True:
                     try:
-                        idx, item = await queue.get()
+                        _, item = await queue.get()
                     except asyncio.CancelledError:
                         break
 
@@ -236,8 +231,5 @@ async def crawl_law_page(page_no: int, workers: int, browser_count: int) -> str:
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(json.dumps(results, ensure_ascii=False, indent=2).replace("\\n","\n"))
-
-    elapsed = time.time() - start
-    tqdm.write(f"[Activity] page {page_no} 완료 | {elapsed:.1f}초")
 
     return path
